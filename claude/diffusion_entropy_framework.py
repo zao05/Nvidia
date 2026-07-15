@@ -162,6 +162,21 @@ class DiffusionModelSpec:
     #     Dream default, "confidence"/"maskgit_plus"); 'random' = random order.
     remasking: str = "low_confidence"
 
+    # >>> CUSTOMIZE: HOW MANY positions to commit each step.
+    #     'fixed'  -> exactly gen_length/steps per step (the LLaDA/Dream default).
+    #                 NOTE: this makes the freeze curve linear and the "aha" histogram
+    #                 uniform BY CONSTRUCTION -- those plots then re-describe the fixed
+    #                 schedule, not the model. Faithful to how LLaDA actually samples.
+    #     'confidence_threshold' -> commit every masked position whose confidence
+    #                 exceeds `confidence_threshold` (model-driven). The number
+    #                 committed per step now varies with the model's certainty, so the
+    #                 freeze/aha plots become informative. Best choice for ANALYSIS.
+    schedule: str = "fixed"
+
+    # Confidence (top-1 prob) cutoff for schedule='confidence_threshold'. 0.9 is a
+    # reasonable start; lower it if generation stalls (few tokens clear the bar).
+    confidence_threshold: float = 0.9
+
     # >>> CUSTOMIZE: sampling temperature used to pick the committed token id.
     #     0.0 = greedy argmax (deterministic, best for analysis reproducibility).
     temperature: float = 0.0
@@ -199,7 +214,8 @@ class DiffusionModelSpec:
 
 
 # ---- Ready-made presets (verified against the official reference implementations) ----
-def spec_for_llada(gen_length=128, steps=128, block_length=128, temperature=0.0) -> DiffusionModelSpec:
+def spec_for_llada(gen_length=128, steps=128, block_length=128, temperature=0.0,
+                   tokenizer=None, schedule="fixed", confidence_threshold=0.9) -> DiffusionModelSpec:
     """
     LLaDA-8B (GSAI-ML/LLaDA-8B-Instruct / -Base). Dense masked diffusion.
     Load with:
@@ -210,7 +226,13 @@ def spec_for_llada(gen_length=128, steps=128, block_length=128, temperature=0.0)
     The official sampler uses mask_id=126336 and a plain `model(x).logits` forward
     with NO KV cache (full sequence re-encoded each step) -- exactly the assumption
     our controlled loop needs.
+
+    Pass `tokenizer` to auto-exclude EOS/PAD/MASK from the entropy (removes the
+    misleading low-entropy band at trailing padding positions). Use
+    schedule='confidence_threshold' if you want the freeze/aha plots to be
+    model-driven instead of a straight line (see DiffusionModelSpec.schedule).
     """
+    exclude = _structural_ids(tokenizer, mask_id=126336)
     return DiffusionModelSpec(
         name="LLaDA-8B",
         mask_token_id=126336,          # verified: LLaDA reserved [MASK] id
@@ -219,8 +241,25 @@ def spec_for_llada(gen_length=128, steps=128, block_length=128, temperature=0.0)
         block_length=block_length,
         remasking="low_confidence",
         temperature=temperature,
+        entropy_exclude_ids=exclude,
+        schedule=schedule,
+        confidence_threshold=confidence_threshold,
         is_moe=False,
     )
+
+
+def _structural_ids(tokenizer, mask_id=None) -> list:
+    """Collect EOS / PAD / (optional) MASK ids to exclude from entropy. Safe if
+    tokenizer is None (returns just mask_id, or [] )."""
+    ids = set()
+    if mask_id is not None:
+        ids.add(mask_id)
+    if tokenizer is not None:
+        for attr in ("eos_token_id", "pad_token_id", "mask_token_id"):
+            v = getattr(tokenizer, attr, None)
+            if isinstance(v, int):
+                ids.add(v)
+    return sorted(ids)
 
 
 def spec_for_dream(tokenizer, gen_length=128, steps=128, temperature=0.0) -> DiffusionModelSpec:
@@ -243,6 +282,7 @@ def spec_for_dream(tokenizer, gen_length=128, steps=128, temperature=0.0) -> Dif
         block_length=gen_length,       # Dream default is single-block full-diffusion
         remasking="low_confidence",
         temperature=temperature,
+        entropy_exclude_ids=_structural_ids(tokenizer, mask_id=mask_id),
         is_moe=False,
     )
 
@@ -331,7 +371,7 @@ def run_controlled_denoising(model, tokenizer, prompt_ids: torch.Tensor,
             blk_lo = prompt_len + b * spec.block_length
             blk_hi = prompt_len + (b + 1) * spec.block_length
             n_masked_block = int((x[0, blk_lo:blk_hi] == mask_id).sum().item())
-            schedule = _num_transfer_per_step(n_masked_block, steps_per_block)
+            transfer_counts = _num_transfer_per_step(n_masked_block, steps_per_block)
 
             for s in range(steps_per_block):
                 mask_index = (x == mask_id)                                  # [1, seq]
@@ -371,11 +411,26 @@ def run_controlled_denoising(model, tokenizer, prompt_ids: torch.Tensor,
                     order_score = torch.where(block_mask_local,
                                               torch.rand(spec.block_length, device=device), neg_inf)
 
-                k = min(schedule[s], int(block_mask_local.sum().item()))
+                n_masked_now = int(block_mask_local.sum().item())
                 commit_local = torch.zeros(spec.block_length, dtype=torch.bool, device=device)
-                if k > 0:
-                    top_idx = torch.topk(order_score, k).indices
-                    commit_local[top_idx] = True
+                is_last_step = (s == steps_per_block - 1)
+
+                if spec.schedule == "confidence_threshold":
+                    # Model-driven: commit every masked position above the threshold.
+                    # Guarantee progress (>=1/step) and termination (flush on last step),
+                    # so the freeze/aha curves reflect the model, not a fixed schedule.
+                    if is_last_step:
+                        commit_local = block_mask_local.clone()               # flush remainder
+                    else:
+                        commit_local = block_mask_local & (block_conf >= spec.confidence_threshold)
+                        if commit_local.sum() == 0 and n_masked_now > 0:
+                            commit_local[torch.argmax(order_score)] = True    # force >=1
+                else:  # 'fixed' (LLaDA/Dream default)
+                    k = min(transfer_counts[s], n_masked_now)
+                    if is_last_step:
+                        k = n_masked_now                                      # flush remainder
+                    if k > 0:
+                        commit_local[torch.topk(order_score, k).indices] = True
 
                 # ---- Record one row per gen position (BEFORE applying the commit) ----
                 entropy_l = entropy.tolist()
@@ -676,7 +731,13 @@ class DiffusionPlots:
 
     @staticmethod
     def aha_moment_histogram(df, save_path="aha_moment.png"):
-        """When does each token experience its largest entropy drop / get committed?"""
+        """When does each token get decided?
+
+        CAVEAT: with schedule='fixed' the sampler commits exactly gen_length/steps
+        tokens every step, so this histogram is UNIFORM by construction -- it re-plots
+        the fixed schedule, not the model. Use spec.schedule='confidence_threshold'
+        to make the number committed per step model-driven; then this histogram
+        reveals the steps at which the model actually gains confidence."""
         DiffusionPlots._theme()
         # Prefer the exact commit step when available (Backend A); else max entropy drop.
         if "committed_at_step" in df.columns and df["committed_at_step"].notna().any():
@@ -700,6 +761,12 @@ class DiffusionPlots:
 
     @staticmethod
     def freeze_curve(df, save_path="freeze_curve.png"):
+        """Cumulative fraction of tokens that have locked in, over steps.
+
+        CAVEAT: with schedule='fixed' this is a straight diagonal by construction
+        (a constant number of tokens commit per step). It only becomes an
+        informative S-curve under schedule='confidence_threshold', where the model
+        decides how many tokens to lock per step."""
         DiffusionPlots._theme()
         n_pos = df["canvas_position"].nunique()
         max_step = int(df["denoising_step"].max())
@@ -757,7 +824,16 @@ if __name__ == "__main__":
         MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
     ).cuda().eval()
 
-    spec = spec_for_llada(gen_length=128, steps=128, block_length=32, temperature=0.0)
+    # Pass `tokenizer` so EOS/PAD/MASK are excluded from entropy (removes the
+    # misleading low-entropy band at trailing padding positions).
+    # schedule='confidence_threshold' makes the freeze/aha plots model-driven; use
+    # schedule='fixed' to reproduce the exact LLaDA sampler (freeze curve then linear).
+    spec = spec_for_llada(
+        gen_length=128, steps=128, block_length=32, temperature=0.0,
+        tokenizer=tokenizer,
+        schedule="confidence_threshold",   # <-- was implicitly 'fixed' before
+        confidence_threshold=0.9,
+    )
 
     # ---------------------------------------------------------------------------------
     # >>> CUSTOMIZE: your prompt. LLaDA-Instruct expects its chat template.

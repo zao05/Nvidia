@@ -71,3 +71,54 @@ uncertainty-while-undecided.
 
 Every user-editable point is marked `>>> CUSTOMIZE` in the code, and presets are
 provided for LLaDA (`spec_for_llada`) and Dream (`spec_for_dream`).
+
+## 4. Reading the plots (and the LLaDA-8B run)
+
+The representation is correct; here is what each plot means and why an actual
+LLaDA-8B run looks the way it does.
+
+- **Denoising heatmap** — token position (rows) × step (cols) × entropy. The
+  lower-left triangle (still-masked positions) is high-entropy; the upper-right
+  (committed) is blank under `mask_aware=True`. The diagonal is the
+  confidence-ordered **unmask wavefront**: the order in which the model becomes
+  confident is the real signal here.
+- **Convergence curve** — mean entropy over *still-undecided* tokens per step.
+  For LLaDA this stays **high (~4.7 nats) for most of the run and collapses only
+  in the last ~10–15 steps**. That is genuine and informative: LLaDA commits by
+  *confidence rank*, always removing the least-uncertain masked token, so the pool
+  of survivors stays uncertain until context is nearly complete.
+- **"Aha" histogram** and **freeze curve** — see the three observations below.
+
+### Your three observations — explained
+
+1. **"Early and later tokens sit at constant low entropy, never high."**
+   - *Later positions* (~last 5): the response is shorter than `gen_length`, so the
+     trailing slots are **padding**, which the model confidently fills with
+     `<eos>/<pad>` → low entropy. That is a real artifact, now removed by excluding
+     `<eos>/<pad>/<mask>` from the entropy (pass `tokenizer=` to `spec_for_llada`,
+     which sets `entropy_exclude_ids`).
+   - *Earliest positions* (0–a few): they are the most predictable (sentence
+     openings), so they are committed in the first step or two and only ever show
+     one high-entropy cell before being blanked. Not a bug.
+
+2. **"The aha histogram is flat — entropy falls at a constant rate."**
+   This is **correct behaviour of the default fixed schedule, not a bug.** LLaDA's
+   reference sampler commits exactly `gen_length/steps` tokens per step (here 1
+   token/step). Since each token's "decision step" is its commit step, the
+   histogram is *uniform by construction* — it re-plots the schedule, not the model.
+
+3. **"The freeze curve rises linearly."** Same root cause: a constant number of
+   tokens lock in per step, so the cumulative fraction is a straight diagonal. It
+   is a property of the **sampler's schedule**, not the model's confidence.
+
+### The fix for observations 2 & 3
+
+Set `schedule='confidence_threshold'` on the spec (now the default in the example).
+Instead of committing a fixed count per step, the loop commits **every masked
+position whose top-1 confidence exceeds a threshold**, so the number locked per
+step is model-driven. The freeze curve becomes a real S-curve and the aha histogram
+concentrates on the steps where the model actually gains confidence. Use
+`schedule='fixed'` to reproduce the exact LLaDA sampler (and the linear curves).
+
+The heatmap and convergence curve were already correct; observations 2 & 3 were
+the two plots that, under a fixed schedule, only re-describe the schedule.
