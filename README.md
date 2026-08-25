@@ -19,7 +19,7 @@ We evaluate token dynamics across four primary architectural families through th
 
 ## Entropy Analysis and Codebase
 The second part of the research focused on analyzing entropy of different architectures. Models in this study were trained and tested on the Wikitext dataset (unless otherwise stated). 
-*   **General Algorithm:** We have provided a general algorithm in this repository so that users can easily analyze the token entropy of any open-weight LLMs of their choice on any dataset of their choice.
+*   **General Algorithm:** We have provided several general algorithm in this repository so that users can easily analyze the token entropy of any open-weight LLMs of their choice on any dataset of their choice. The algorithm to be used depends on model type (refer to the IPYNB files for instructions).
 
 ## Key Findings during Entropy Analysis
 Key insights from the entropy analysis include:
