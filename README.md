@@ -25,5 +25,5 @@ The second part of the research focused on analyzing entropy of different archit
 Key insights from the entropy analysis include:
 *   **Family Clustering:** Entropy profiles cluster strictly by model family rather than parameter size, indicating shared prediction dynamics driven by architectural and training choices.
 *   **Depth-Rescaling Invariance:** Models within the same family show striking trajectory alignments when mapped to relative layer depth, implying that model scale dictates computational resolution rather than qualitative for.
-*   **Diffusion "Ignorance is Bliss" Dynamics:** Diffusion models exhibit a non-linear entropy curve starting at zero static, peaking into high uncertainty as signals emerge, and dropping back to zero upon crystallization, marked by an abrupt "Aha!" moment of massive information gain.
+*   **Diffusion "Ignorance is Bliss" Dynamics:** Diffusion models exhibit a non-linear entropy curve starting at zero static, peaking into high uncertainty as signals emerge, and dropping back to zero upon crystallization.
 *   **MoE Router Independence:** In Mixture-of-Experts models, router entropy (expert uncertainty) remains mathematically decoupled and independent from token prediction entropy.
